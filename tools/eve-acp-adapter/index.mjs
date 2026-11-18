@@ -18,6 +18,7 @@ async function streamTurn(eveSessionId, acpSessionId) {
   const res = await fetch(`${EVE_URL}/eve/v1/session/${eveSessionId}/stream`, { headers: JSON_HEADERS });
   if (!res.ok || !res.body) throw new Error(`Eve stream returned ${res.status}`);
   const decoder = new TextDecoder();
+  const textParts = new Set(); // ids of the reply parts; reasoning parts are skipped
   let buffer = "";
   for await (const chunk of res.body) {
     buffer += decoder.decode(chunk, { stream: true });
@@ -27,18 +28,23 @@ async function streamTurn(eveSessionId, acpSessionId) {
       buffer = buffer.slice(idx + 1);
       if (!line) continue;
       const event = JSON.parse(line);
-      if (event.type === "message.appended" && event.data?.messageDelta) {
-        notify("session/update", {
-          sessionId: acpSessionId,
-          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: event.data.messageDelta } },
-        });
+      if (event.progress?.type === "content.delta") {
+        const { delta, kind, partId } = event.progress.data ?? {};
+        if (kind === "text") textParts.add(partId);
+        if (delta && textParts.has(partId)) {
+          notify("session/update", {
+            sessionId: acpSessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: delta } },
+          });
+        }
       }
-      if (event.type === "session.failed") throw new Error("Eve session failed");
-      if (event.type === "session.waiting" || event.type === "turn.settled") return;
+      for (const fact of event.facts ?? []) {
+        if (fact.type === "session.failed") throw new Error("Eve session failed");
+        if (fact.type === "turn.settled") return;
+      }
     }
   }
 }
-
 // Sends the prompt to Eve: starts a session the first time, then continues it with the stored token.
 async function askEve(acpSessionId, text) {
   const current = eveSessions.get(acpSessionId);
