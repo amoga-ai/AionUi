@@ -14,11 +14,12 @@ const fail = (id, code, message) => write({ id, error: { code, message } });
 const notify = (method, params) => write({ method, params });
 
 // Reads Eve's NDJSON stream for one turn, sends each text piece to AionUI, and stops when Eve is waiting for the next message.
-async function streamTurn(eveSessionId, acpSessionId) {
+async function streamTurn(eveSessionId, acpSessionId, doneTurns) {
   const res = await fetch(`${EVE_URL}/eve/v1/session/${eveSessionId}/stream`, { headers: JSON_HEADERS });
   if (!res.ok || !res.body) throw new Error(`Eve stream returned ${res.status}`);
   const decoder = new TextDecoder();
   const textParts = new Set(); // ids of the reply parts; reasoning parts are skipped
+  let activeTurn = null; // the new turn this prompt started
   let buffer = "";
   for await (const chunk of res.body) {
     buffer += decoder.decode(chunk, { stream: true });
@@ -28,6 +29,15 @@ async function streamTurn(eveSessionId, acpSessionId) {
       buffer = buffer.slice(idx + 1);
       if (!line) continue;
       const event = JSON.parse(line);
+      for (const fact of event.facts ?? []) {
+        if (fact.type === "turn.started" && !doneTurns.has(fact.data.turnId)) activeTurn = fact.data.turnId;
+        if (fact.type === "session.failed") throw new Error("Eve session failed");
+        if (fact.type === "turn.settled" && fact.data.turnId === activeTurn) {
+          doneTurns.add(activeTurn);
+          return;
+        }
+      }
+      if (!activeTurn) continue; // ignore replayed events from older turns
       if (event.progress?.type === "content.delta") {
         const { delta, kind, partId } = event.progress.data ?? {};
         if (kind === "text") textParts.add(partId);
@@ -38,13 +48,10 @@ async function streamTurn(eveSessionId, acpSessionId) {
           });
         }
       }
-      for (const fact of event.facts ?? []) {
-        if (fact.type === "session.failed") throw new Error("Eve session failed");
-        if (fact.type === "turn.settled") return;
-      }
     }
   }
 }
+
 // Sends the prompt to Eve: starts a session the first time, then continues it with the stored token.
 async function askEve(acpSessionId, text) {
   const current = eveSessions.get(acpSessionId);
@@ -61,13 +68,14 @@ async function askEve(acpSessionId, text) {
       });
   if (!res.ok) throw new Error(`Eve returned ${res.status}`);
   const body = await res.json();
+  const doneTurns = current?.doneTurns ?? new Set();
   eveSessions.set(acpSessionId, {
     sessionId: body.sessionId,
     continuationToken: body.continuationToken ?? current?.continuationToken,
+    doneTurns,
   });
-  await streamTurn(body.sessionId, acpSessionId);
+  await streamTurn(body.sessionId, acpSessionId, doneTurns);
 }
-
 async function handle(msg) {
   const { id, method, params } = msg;
   switch (method) {
