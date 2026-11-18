@@ -1,19 +1,22 @@
 // ACP adapter: lets AionUI talk to the self-hosted Eve agent over stdin/stdout (JSON-RPC, one message per line).
 // Env: EVE_URL (base URL), EVE_USERNAME, EVE_PASSWORD (httpBasic).
 import readline from "node:readline";
+import fs from "node:fs/promises";
+import path from "node:path";
 
 const EVE_URL = process.env.EVE_URL ?? "";
 const AUTH = "Basic " + Buffer.from(`${process.env.EVE_USERNAME ?? ""}:${process.env.EVE_PASSWORD ?? ""}`).toString("base64");
 const JSON_HEADERS = { "content-type": "application/json", authorization: AUTH };
 let sessionCounter = 0;
-const eveSessions = new Map(); // AionUI session id -> { sessionId, continuationToken }
+const eveSessions = new Map(); // AionUI session id -> { sessionId, continuationToken, doneTurns }
+const sessionFolders = new Map(); // AionUI session id -> folder where that chat's files are saved
 
 const write = (obj) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...obj }) + "\n");
 const respond = (id, result) => write({ id, result });
 const fail = (id, code, message) => write({ id, error: { code, message } });
 const notify = (method, params) => write({ method, params });
 
-// Reads Eve's NDJSON stream for one turn, sends each text piece to AionUI, and stops when Eve is waiting for the next message.
+// Reads Eve's stream until the turn that this prompt started has settled. Older turns are skipped.
 async function streamTurn(eveSessionId, acpSessionId, doneTurns) {
   const res = await fetch(`${EVE_URL}/eve/v1/session/${eveSessionId}/stream`, { headers: JSON_HEADERS });
   if (!res.ok || !res.body) throw new Error(`Eve stream returned ${res.status}`);
@@ -35,6 +38,15 @@ async function streamTurn(eveSessionId, acpSessionId, doneTurns) {
         if (fact.type === "turn.settled" && fact.data.turnId === activeTurn) {
           doneTurns.add(activeTurn);
           return;
+        }
+        if (activeTurn && fact.type === "call.settled" && fact.data?.output?.base64 && fact.data?.output?.fileName) {
+          const folder = sessionFolders.get(acpSessionId) ?? process.cwd();
+          const name = path.basename(fact.data.output.fileName);
+          await fs.writeFile(path.join(folder, name), Buffer.from(fact.data.output.base64, "base64"));
+          notify("session/update", {
+            sessionId: acpSessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `Saved file: ${name}` } },
+          });
         }
       }
       if (!activeTurn) continue; // ignore replayed events from older turns
@@ -76,6 +88,7 @@ async function askEve(acpSessionId, text) {
   });
   await streamTurn(body.sessionId, acpSessionId, doneTurns);
 }
+
 async function handle(msg) {
   const { id, method, params } = msg;
   switch (method) {
@@ -83,13 +96,15 @@ async function handle(msg) {
       return respond(id, {
         protocolVersion: 1,
         serverCapabilities: { streaming: true, sessionManagement: true },
-        serverInfo: { name: "eve-acp-adapter", version: "0.2.0" },
+        serverInfo: { name: "eve-acp-adapter", version: "0.3.0" },
         auth_methods: [],
       });
     case "session/new": {
       sessionCounter++;
+      const sessionId = `eve-session-${sessionCounter}`;
+      sessionFolders.set(sessionId, params?.cwd ?? process.cwd());
       return respond(id, {
-        sessionId: `eve-session-${sessionCounter}`,
+        sessionId,
         modes: [],
         configOptions: [],
         models: { currentModelId: "eve", availableModels: [{ id: "eve", name: "Eve" }] },
