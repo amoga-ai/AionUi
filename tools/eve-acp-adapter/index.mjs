@@ -1,28 +1,65 @@
 // ACP adapter: lets AionUI talk to the self-hosted Eve agent over stdin/stdout (JSON-RPC, one message per line).
-// Env: EVE_URL (base URL), EVE_USERNAME, EVE_PASSWORD (httpBasic), EVE_SEND_PATH (route that accepts a message; confirm on your Eve app).
+// Env: EVE_URL (base URL), EVE_USERNAME, EVE_PASSWORD (httpBasic).
 import readline from "node:readline";
 
 const EVE_URL = process.env.EVE_URL ?? "";
-const EVE_SEND_PATH = process.env.EVE_SEND_PATH ?? "/eve/v1/sessions/{sessionId}/messages";
 const AUTH = "Basic " + Buffer.from(`${process.env.EVE_USERNAME ?? ""}:${process.env.EVE_PASSWORD ?? ""}`).toString("base64");
+const JSON_HEADERS = { "content-type": "application/json", authorization: AUTH };
 let sessionCounter = 0;
+const eveSessions = new Map(); // AionUI session id -> { sessionId, continuationToken }
 
 const write = (obj) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...obj }) + "\n");
 const respond = (id, result) => write({ id, result });
 const fail = (id, code, message) => write({ id, error: { code, message } });
 const notify = (method, params) => write({ method, params });
 
-// Sends the prompt text to Eve and returns Eve's reply text.
-async function askEve(sessionId, text) {
-  const path = EVE_SEND_PATH.replace("{sessionId}", encodeURIComponent(sessionId));
-  const res = await fetch(EVE_URL + path, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: AUTH },
-    body: JSON.stringify({ message: text }),
-  });
+// Reads Eve's NDJSON stream for one turn, sends each text piece to AionUI, and stops when Eve is waiting for the next message.
+async function streamTurn(eveSessionId, acpSessionId) {
+  const res = await fetch(`${EVE_URL}/eve/v1/session/${eveSessionId}/stream`, { headers: JSON_HEADERS });
+  if (!res.ok || !res.body) throw new Error(`Eve stream returned ${res.status}`);
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for await (const chunk of res.body) {
+    buffer += decoder.decode(chunk, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, idx).trim();
+      buffer = buffer.slice(idx + 1);
+      if (!line) continue;
+      const event = JSON.parse(line);
+      if (event.type === "message.appended" && event.data?.messageDelta) {
+        notify("session/update", {
+          sessionId: acpSessionId,
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: event.data.messageDelta } },
+        });
+      }
+      if (event.type === "session.failed") throw new Error("Eve session failed");
+      if (event.type === "session.waiting" || event.type === "turn.settled") return;
+    }
+  }
+}
+
+// Sends the prompt to Eve: starts a session the first time, then continues it with the stored token.
+async function askEve(acpSessionId, text) {
+  const current = eveSessions.get(acpSessionId);
+  const res = current
+    ? await fetch(`${EVE_URL}/eve/v1/session/${current.sessionId}`, {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ continuationToken: current.continuationToken, message: text }),
+      })
+    : await fetch(`${EVE_URL}/eve/v1/session`, {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ message: text }),
+      });
   if (!res.ok) throw new Error(`Eve returned ${res.status}`);
-  const body = await res.json().catch(() => null);
-  return typeof body?.text === "string" ? body.text : JSON.stringify(body ?? "");
+  const body = await res.json();
+  eveSessions.set(acpSessionId, {
+    sessionId: body.sessionId,
+    continuationToken: body.continuationToken ?? current?.continuationToken,
+  });
+  await streamTurn(body.sessionId, acpSessionId);
 }
 
 async function handle(msg) {
@@ -32,7 +69,8 @@ async function handle(msg) {
       return respond(id, {
         protocolVersion: 1,
         serverCapabilities: { streaming: true, sessionManagement: true },
-        serverInfo: { name: "eve-acp-adapter", version: "0.1.0" },
+        serverInfo: { name: "eve-acp-adapter", version: "0.2.0" },
+        auth_methods: [],
       });
     case "session/new": {
       sessionCounter++;
@@ -47,11 +85,7 @@ async function handle(msg) {
       const sessionId = params?.sessionId ?? "unknown";
       const text = Array.isArray(params?.prompt) && params.prompt[0]?.text ? params.prompt[0].text : "";
       try {
-        const reply = await askEve(sessionId, text);
-        notify("session/update", {
-          sessionId,
-          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: reply } },
-        });
+        await askEve(sessionId, text);
         return respond(id, { stopReason: "end_turn" });
       } catch (err) {
         return fail(id, -32000, String(err?.message ?? err));
