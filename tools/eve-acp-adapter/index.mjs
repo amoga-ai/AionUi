@@ -47,10 +47,11 @@ async function streamTurn(eveSessionId, acpSessionId, doneTurns) {
         if (!activeTurn) continue; // ignore replayed events from older turns
         if (type === "session.failed") throw new Error("Eve session failed");
         if (type === "message.appended" && data.messageDelta) say(data.messageDelta);
-        if (type === "call.settled" && data?.output?.base64 && data?.output?.fileName) {
+        const output = data?.result?.output ?? data?.output;
+        if ((type === "action.result" || type === "call.settled") && output?.base64 && output?.fileName) {
           const folder = sessionFolders.get(acpSessionId) ?? process.cwd();
-          const name = path.basename(data.output.fileName);
-          await fs.writeFile(path.join(folder, name), Buffer.from(data.output.base64, "base64"));
+          const name = path.basename(output.fileName);
+          await fs.writeFile(path.join(folder, name), Buffer.from(output.base64, "base64"));
           say(`Saved file: ${name}`);
         }
         if ((type === "turn.completed" || type === "turn.settled") && data.turnId === activeTurn) {
