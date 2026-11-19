@@ -21,9 +21,14 @@ async function streamTurn(eveSessionId, acpSessionId, doneTurns) {
   const res = await fetch(`${EVE_URL}/eve/v1/session/${eveSessionId}/stream`, { headers: JSON_HEADERS });
   if (!res.ok || !res.body) throw new Error(`Eve stream returned ${res.status}`);
   const decoder = new TextDecoder();
-  const textParts = new Set(); // ids of the reply parts; reasoning parts are skipped
-  let activeTurn = null; // the new turn this prompt started
+  const textParts = new Set();
+  let activeTurn = null;
   let buffer = "";
+  const say = (text) =>
+    notify("session/update", {
+      sessionId: acpSessionId,
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+    });
   for await (const chunk of res.body) {
     buffer += decoder.decode(chunk, { stream: true });
     let idx;
@@ -32,38 +37,36 @@ async function streamTurn(eveSessionId, acpSessionId, doneTurns) {
       buffer = buffer.slice(idx + 1);
       if (!line) continue;
       const event = JSON.parse(line);
-      for (const fact of event.facts ?? []) {
-        if (fact.type === "turn.started" && !doneTurns.has(fact.data.turnId)) activeTurn = fact.data.turnId;
-        if (fact.type === "session.failed") throw new Error("Eve session failed");
-        if (fact.type === "turn.settled" && fact.data.turnId === activeTurn) {
+      // Newer format: one flat event per line. Older format: a list of facts per line.
+      const items = [
+        ...(event.type ? [{ type: event.type, data: event.data }] : []),
+        ...(event.facts ?? []).map((f) => ({ type: f.type, data: f.data })),
+      ];
+      for (const { type, data } of items) {
+        if (type === "turn.started" && !doneTurns.has(data.turnId)) activeTurn = data.turnId;
+        if (!activeTurn) continue; // ignore replayed events from older turns
+        if (type === "session.failed") throw new Error("Eve session failed");
+        if (type === "message.appended" && data.messageDelta) say(data.messageDelta);
+        if (type === "call.settled" && data?.output?.base64 && data?.output?.fileName) {
+          const folder = sessionFolders.get(acpSessionId) ?? process.cwd();
+          const name = path.basename(data.output.fileName);
+          await fs.writeFile(path.join(folder, name), Buffer.from(data.output.base64, "base64"));
+          say(`Saved file: ${name}`);
+        }
+        if ((type === "turn.completed" || type === "turn.settled") && data.turnId === activeTurn) {
           doneTurns.add(activeTurn);
           return;
         }
-        if (activeTurn && fact.type === "call.settled" && fact.data?.output?.base64 && fact.data?.output?.fileName) {
-          const folder = sessionFolders.get(acpSessionId) ?? process.cwd();
-          const name = path.basename(fact.data.output.fileName);
-          await fs.writeFile(path.join(folder, name), Buffer.from(fact.data.output.base64, "base64"));
-          notify("session/update", {
-            sessionId: acpSessionId,
-            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `Saved file: ${name}` } },
-          });
-        }
       }
-      if (!activeTurn) continue; // ignore replayed events from older turns
-      if (event.progress?.type === "content.delta") {
+      // Older format: text progress deltas, skipping reasoning parts.
+      if (activeTurn && event.progress?.type === "content.delta") {
         const { delta, kind, partId } = event.progress.data ?? {};
         if (kind === "text") textParts.add(partId);
-        if (delta && textParts.has(partId)) {
-          notify("session/update", {
-            sessionId: acpSessionId,
-            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: delta } },
-          });
-        }
+        if (delta && textParts.has(partId)) say(delta);
       }
     }
   }
 }
-
 // Sends the prompt to Eve: starts a session the first time, then continues it with the stored token.
 async function askEve(acpSessionId, text) {
   const current = eveSessions.get(acpSessionId);
